@@ -493,6 +493,170 @@ def register(mcp) -> None:
         finally:
             _hook_slots.release()
 
+
+    @mcp.custom_route("/breath-search", methods=["GET"])
+    async def breath_search(request):
+        from starlette.responses import JSONResponse
+        if not _is_hook_request_authorized(request):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+        query = (request.query_params.get("q") or "").strip()
+        if not query:
+            return JSONResponse({"error": "missing q parameter"}, status_code=400)
+
+        try:
+            max_results = max(1, min(int(request.query_params.get("max_results", "5")), 10))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "max_results must be an integer in [1,10]"}, status_code=400)
+
+        try:
+            from tools._common import check_query_size  # type: ignore
+            query_error = check_query_size(query)
+            if query_error:
+                return JSONResponse({"error": query_error}, status_code=400)
+        except ImportError:
+            pass
+
+        try:
+            vector_scores: dict = {}
+            note = ""
+            engine = sh.embedding_engine
+            if engine and getattr(engine, "enabled", False):
+                try:
+                    strict_search = getattr(engine, "search_similar_strict", None)
+                    if callable(strict_search):
+                        pairs = await strict_search(query, top_k=50)
+                    else:
+                        pairs = await engine.search_similar(query, top_k=50)
+                    vector_scores = {bid: float(score) for bid, score in pairs}
+                except Exception as exc:
+                    logger.warning("breath_search semantic search failed: %s", exc)
+                    note = "语义索引暂不可用，仅使用关键词/BM25"
+
+            matches = await sh.bucket_mgr.search(query, limit=max_results, vector_scores=vector_scores)
+            results = []
+            for b in matches:
+                if not _SURFACE_POLICY.evaluate_bucket(b, mode="search").allowed:
+                    continue
+                meta = b.get("metadata") or {}
+                results.append({
+                    "bucket_id": b["id"],
+                    "content": strip_wikilinks(str(b.get("content") or "")),
+                    "tags": meta.get("tags") or [],
+                    "importance": meta.get("importance"),
+                    "created_at": meta.get("created"),
+                })
+                if len(results) >= max_results:
+                    break
+
+            return JSONResponse(
+                {"results": results, "note": note},
+                headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+            )
+        except Exception as exc:
+            logger.warning("breath_search failed: %s", exc)
+            return JSONResponse({"error": str(exc)}, status_code=500)
+
+    @mcp.custom_route("/breath-advanced", methods=["GET"])
+    async def breath_advanced(request):
+        from starlette.responses import JSONResponse
+        if not _is_hook_request_authorized(request):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+        query = (request.query_params.get("q") or "").strip()
+        if not query:
+            return JSONResponse({"error": "missing q parameter"}, status_code=400)
+
+        try:
+            max_results = max(1, min(int(request.query_params.get("max_results", "5")), 10))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "max_results must be an integer in [1,10]"}, status_code=400)
+
+        tags_raw = request.query_params.get("tags", "")
+        filter_tags = [t.strip() for t in tags_raw.split(",") if t.strip()] if tags_raw else []
+
+        importance_min = None
+        importance_min_raw = request.query_params.get("importance_min", "")
+        if importance_min_raw:
+            try:
+                importance_min = max(1, min(10, int(importance_min_raw)))
+            except (TypeError, ValueError):
+                return JSONResponse({"error": "importance_min must be integer in [1,10]"}, status_code=400)
+
+        catalog = (request.query_params.get("catalog") or "").strip() or None
+
+        try:
+            try:
+                from tools._common import check_query_size  # type: ignore
+                query_error = check_query_size(query)
+                if query_error:
+                    return JSONResponse({"error": query_error}, status_code=400)
+            except ImportError:
+                pass
+
+            vector_scores: dict = {}
+            note = ""
+            engine = sh.embedding_engine
+            if engine and getattr(engine, "enabled", False):
+                try:
+                    strict_search = getattr(engine, "search_similar_strict", None)
+                    if callable(strict_search):
+                        pairs = await strict_search(query, top_k=50)
+                    else:
+                        pairs = await engine.search_similar(query, top_k=50)
+                    vector_scores = {bid: float(score) for bid, score in pairs}
+                except Exception as exc:
+                    logger.warning("breath_advanced semantic search failed: %s", exc)
+                    note = "语义索引暂不可用，仅使用关键词/BM25"
+
+            matches = await sh.bucket_mgr.search(
+                query, limit=max_results * 3, vector_scores=vector_scores
+            )
+            results = []
+            for b in matches:
+                if not _SURFACE_POLICY.evaluate_bucket(b, mode="search").allowed:
+                    continue
+                meta = b.get("metadata") or {}
+
+                if filter_tags:
+                    bucket_tags = meta.get("tags") or []
+                    if isinstance(bucket_tags, str):
+                        bucket_tags = [t.strip() for t in bucket_tags.split(",")]
+                    if not any(ft in bucket_tags for ft in filter_tags):
+                        continue
+
+                if importance_min is not None:
+                    imp = meta.get("importance")
+                    try:
+                        if imp is None or int(imp) < importance_min:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+
+                if catalog is not None:
+                    bucket_catalog = meta.get("catalog") or meta.get("domain") or []
+                    if isinstance(bucket_catalog, str):
+                        bucket_catalog = [bucket_catalog]
+                    if catalog not in bucket_catalog:
+                        continue
+
+                results.append({
+                    "bucket_id": b["id"],
+                    "content": strip_wikilinks(str(b.get("content") or "")),
+                    "tags": meta.get("tags") or [],
+                    "importance": meta.get("importance"),
+                    "created_at": meta.get("created"),
+                })
+                if len(results) >= max_results:
+                    break
+
+            return JSONResponse(
+                {"results": results, "note": note},
+                headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+            )
+        except Exception as exc:
+            logger.warning("breath_advanced failed: %s", exc)
+            return JSONResponse({"error": str(exc)}, status_code=500)
     # 注意：这里**故意不再提供 /dream-hook**。
     # 按 OB 的设计哲学，dream（做梦消化）不是义务、不该在每次会话开始被自动触发——
     # 它只应在「需要消化时」由模型主动调用 MCP 的 dream 工具。把它做成 SessionStart hook
