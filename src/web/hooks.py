@@ -38,6 +38,10 @@ _HOOK_RATE_SOURCE_LIMIT = 10
 _HOOK_RATE_GLOBAL_LIMIT = 60
 _HOOK_RATE_SOURCE_CAP = 2048
 _HOOK_MIN_BLOCK_TOKENS = 120
+_TREEHOUSE_TOOLS = frozenset({
+    "breath", "breath_search", "breath_advanced", "hold", "grow", "trace",
+    "dream", "anchor", "release", "pulse", "plan", "letter_write", "letter_read", "I",
+})
 _hook_slots = threading.BoundedSemaphore(_HOOK_CONCURRENCY)
 _hook_rate_lock = threading.Lock()
 _hook_source_events: OrderedDict[str, deque[float]] = OrderedDict()
@@ -227,6 +231,49 @@ async def _timeout_after(seconds: float):
 
 
 def register(mcp) -> None:
+
+    @mcp.custom_route("/treehouse-tools", methods=["GET", "POST"])
+    async def treehouse_tools(request):
+        from starlette.responses import JSONResponse
+
+        headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+        token = os.environ.get("OMBRE_TOOL_TOKEN", "").strip()
+        supplied = _header_value(request, "x-ombre-hook-token")
+        if not token or not hmac.compare_digest(supplied.encode(), token.encode()):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401, headers=headers)
+
+        if request.method == "GET":
+            tools = [
+                {"name": tool.name, "description": tool.description or "", "input_schema": tool.inputSchema}
+                for tool in await mcp.list_tools()
+                if tool.name in _TREEHOUSE_TOOLS
+            ]
+            return JSONResponse({"tools": tools}, headers=headers)
+
+        try:
+            data = await request.json()
+        except ValueError:
+            data = None
+        if not isinstance(data, dict):
+            return JSONResponse({"error": "Invalid JSON object"}, status_code=400, headers=headers)
+        name = data.get("name")
+        arguments = data.get("arguments")
+        if not isinstance(name, str) or name not in _TREEHOUSE_TOOLS or not isinstance(arguments, dict):
+            return JSONResponse({"error": "Invalid tool or arguments"}, status_code=400, headers=headers)
+        if not _admit_hook_request(request) or not _hook_slots.acquire(blocking=False):
+            return JSONResponse({"error": "OB tool busy"}, status_code=429, headers=headers)
+        try:
+            result = await mcp.call_tool(name, arguments)
+            content = result[0] if isinstance(result, tuple) else result
+            return JSONResponse(
+                {"content": "\n".join(block.text for block in content if block.type == "text")},
+                headers=headers,
+            )
+        except Exception as exc:
+            logger.warning("Treehouse tool %s failed: %s", name, type(exc).__name__)
+            return JSONResponse({"error": "OB tool call failed"}, status_code=502, headers=headers)
+        finally:
+            _hook_slots.release()
 
     @mcp.custom_route("/breath-hook", methods=["GET"])
     async def breath_hook(request):

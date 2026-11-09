@@ -2,6 +2,7 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -172,6 +173,61 @@ async def test_json_accept_shim_preserves_explicit_or_non_mcp_accept(path, accep
     await middleware(scope, _empty_receive, _discard_send)
 
     assert downstream.scopes[0] is scope
+
+
+@pytest.mark.asyncio
+async def test_treehouse_hook_lists_and_calls_tools_without_changing_mcp_auth(monkeypatch, bucket_mgr):
+    import server
+    from tools import _runtime
+
+    monkeypatch.setenv("OMBRE_HOOK_TOKEN", "read-only-secret")
+    monkeypatch.setenv("OMBRE_HOOK_ALLOW_PUBLIC", "1")
+    monkeypatch.setenv("OMBRE_TOOL_TOKEN", "treehouse-secret")
+    monkeypatch.setattr(_runtime, "bucket_mgr", bucket_mgr)
+    monkeypatch.setattr(_runtime, "dehydrator", SimpleNamespace(
+        analyze=AsyncMock(return_value={"suggested_name": "Treehouse tool test"}),
+    ))
+    app = build_http_app(
+        server.mcp, "streamable-http",
+        settings=HTTPRuntimeSettings(auth_required=True, max_request_bytes=DEFAULT_MAX_MCP_REQUEST_BYTES),
+        token_validator=lambda *_args, **_kwargs: False,
+        lifecycle=RuntimeLifecycle(logger=RecordingLogger()),
+    )
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://localhost") as client:
+        read_only = {"X-Ombre-Hook-Token": "read-only-secret"}
+        treehouse = {"X-Ombre-Hook-Token": "treehouse-secret"}
+        endpoint = "/treehouse-tools"
+        for headers in ({}, read_only):
+            assert (await client.get(endpoint, headers=headers)).status_code == 401
+            assert (await client.post(endpoint, headers=headers)).status_code == 401
+        assert (await client.post("/mcp", headers=treehouse)).status_code == 401
+
+        listing = await client.get(endpoint, headers=treehouse)
+        assert listing.status_code == 200
+        assert listing.headers["cache-control"] == "no-store"
+        assert {tool["name"] for tool in listing.json()["tools"]} == set(EXPECTED_PUBLIC_MCP_TOOLS)
+        assert all(tool["input_schema"]["type"] == "object" for tool in listing.json()["tools"])
+
+        bad = await client.post(endpoint, headers=treehouse, json={"name": "unknown", "arguments": {}})
+        assert bad.status_code == 400
+        pulse = await client.post(endpoint, headers=treehouse, json={"name": "pulse", "arguments": {}})
+        assert pulse.status_code == 200
+        assert pulse.json()["content"]
+
+        async def call(name, **arguments):
+            response = await client.post(endpoint, headers=treehouse, json={"name": name, "arguments": arguments})
+            assert response.status_code == 200, response.text
+            return response.json()["content"]
+
+        await call("hold", content="Synthetic Treehouse note", test_data=True)
+        [created] = await bucket_mgr.list_all()
+        bucket_id = created["id"]
+        await call("trace", bucket_id=bucket_id, old_str="Synthetic", new_str="Revised")
+        assert (await bucket_mgr.get(bucket_id))["content"] == "Revised Treehouse note"
+        await call("trace", bucket_id=bucket_id, delete=True)
+        assert await bucket_mgr.get(bucket_id) is None
+        await call("trace", bucket_id=bucket_id, restore=True)
+        assert (await bucket_mgr.get(bucket_id))["content"] == "Revised Treehouse note"
 
 
 @pytest.mark.asyncio
