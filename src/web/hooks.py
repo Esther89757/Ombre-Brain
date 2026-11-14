@@ -275,6 +275,35 @@ def register(mcp) -> None:
         finally:
             _hook_slots.release()
 
+    @mcp.custom_route("/treehouse-bucket/{bucket_id}", methods=["GET"])
+    async def treehouse_bucket(request):
+        """Exact, read-only storage verification using the existing tool token.
+
+        This bypasses semantic search and surface filters, including feel buckets.
+        It does not touch decay, rewrite content or invoke a model.
+        """
+        from starlette.responses import JSONResponse
+        import re
+
+        headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+        token = os.environ.get("OMBRE_TOOL_TOKEN", "").strip()
+        supplied = _header_value(request, "x-ombre-hook-token")
+        if not token or not hmac.compare_digest(supplied.encode(), token.encode()):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401, headers=headers)
+        bucket_id = request.path_params["bucket_id"]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", bucket_id):
+            return JSONResponse({"error": "Invalid bucket ID"}, status_code=400, headers=headers)
+        try:
+            bucket = await sh.bucket_mgr.get_including_archive(bucket_id)
+        except Exception as exc:
+            logger.warning("Treehouse exact read failed: %s", type(exc).__name__)
+            return JSONResponse({"error": "Storage read unavailable"}, status_code=503, headers=headers)
+        if not bucket:
+            return JSONResponse({"exists": False, "bucket_id": bucket_id}, status_code=404, headers=headers)
+        return JSONResponse({"exists": True, "bucket_id": bucket["id"],
+                             "content": bucket["content"], "metadata": bucket.get("metadata", {})},
+                            headers=headers)
+
     @mcp.custom_route("/breath-hook", methods=["GET"])
     async def breath_hook(request):
         from starlette.responses import PlainTextResponse
